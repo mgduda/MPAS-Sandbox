@@ -1,0 +1,137 @@
+# Reusable workflow: build and validate MPAS-A for a single compiler+MPI using ECT.
+# Called by per-compiler per-MPI subset workflows (e.g. test-gcc-mpich.yml).
+#
+# Runs ECT with 4 MPI ranks. Validation uses the Ensemble Consistency Test
+# (PyCECT) — perturbed runs compared against a pre-built ensemble summary —
+# instead of bit-for-bit log comparison.
+
+name: _test-compiler
+
+permissions:
+  contents: read
+
+on:
+  workflow_call:
+    inputs:
+      compiler:
+        description: 'Compiler family (gcc, nvhpc, oneapi)'
+        required: true
+        type: string
+      mpi:
+        description: 'MPI implementation (mpich, openmpi)'
+        required: true
+        type: string
+      debug:
+        description: 'Enable compiler debugging options'
+        required: false
+        type: string
+        default: ''
+      mpas-repository:
+        description: 'MPAS source repo (e.g. MPAS-Dev/MPAS-Model). Empty = this repo.'
+        required: false
+        type: string
+        default: ''
+      mpas-ref:
+        description: 'Git ref in the MPAS source repo (branch, tag, SHA)'
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  config:
+    name: Resolve Config
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.container.outputs.image }}
+      ect-tag: ${{ steps.version.outputs.ect-tag }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          sparse-checkout: |
+            .github
+            src/core_atmosphere/Registry.xml
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Checkout requested MPAS source for version
+        if: ${{ inputs.mpas-repository != '' || inputs.mpas-ref != '' }}
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          repository: ${{ inputs.mpas-repository || github.repository }}
+          ref: ${{ inputs.mpas-ref || '' }}
+          path: _version-source
+          sparse-checkout: src/core_atmosphere/Registry.xml
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - uses: ./.github/actions/resolve-container
+        id: container
+        with:
+          compiler: ${{ inputs.compiler }}
+          mpi: ${{ inputs.mpi }}
+      - uses: ./.github/actions/mpas-version
+        id: version
+        with:
+          registry-path: ${{ (inputs.mpas-repository != '' || inputs.mpas-ref != '') && '_version-source/src/core_atmosphere/Registry.xml' || 'src/core_atmosphere/Registry.xml' }}
+
+  build:
+    needs: config
+    name: Build (${{ inputs.compiler }}, ${{ inputs.mpi }}, smiol)
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ needs.config.outputs.image }}
+
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          repository: ${{ inputs.mpas-repository || github.repository }}
+          ref: ${{ inputs.mpas-ref || '' }}
+          submodules: 'true'
+          persist-credentials: false
+
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        if: ${{ inputs.mpas-repository != '' }}
+        with:
+          path: _ci
+          sparse-checkout: .github
+          persist-credentials: false
+
+      - name: Overlay CI infrastructure
+        if: ${{ inputs.mpas-repository != '' }}
+        shell: bash
+        run: |
+          cp -r _ci/.github . && rm -rf _ci
+          echo "## Source: ${{ inputs.mpas-repository }}@${{ inputs.mpas-ref }}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build MPAS-A (double precision)
+        uses: ./.github/actions/build-mpas
+        with:
+          compiler: ${{ inputs.compiler }}
+          use-pio: 'false'
+          precision: double
+          debug: 'true'
+
+      - name: Upload executable
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: exe-${{ inputs.compiler }}-${{ inputs.mpi }}-smiol
+          path: atmosphere_model
+          retention-days: 1
+
+  cleanup:
+    needs: [build]
+    if: always()
+    runs-on: ubuntu-latest
+    name: Cleanup
+    permissions:
+      actions: write
+
+    steps:
+      - name: Delete temporary artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh api repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts \
+            --paginate --jq '.artifacts[] | select(.name | startswith("exe-") or startswith("ect-history-")) | .id' \
+          | while read id; do
+              gh api -X DELETE repos/${{ github.repository }}/actions/artifacts/$id || true
+            done || true

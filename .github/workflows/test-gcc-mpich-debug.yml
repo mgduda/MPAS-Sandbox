@@ -1,0 +1,20 @@
+# Subset CI: GNU + MPICH (CPU)
+# Quick ECT validation with 4 MPI ranks.
+
+name: "GNU+MPICH (CPU) DEBUG"
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master, develop]
+  pull_request:
+    branches: [develop]
+
+jobs:
+  test:
+    uses: ./.github/workflows/_test-compiler-debug.yml
+    with:
+      compiler: gcc
+      mpi: mpich
+      debug: true
+
